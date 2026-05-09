@@ -1,266 +1,297 @@
 /**
- * MyMyeloma Backend Server
- * Fixes: DECODER routines::unsupported (Private Key format issue in Render)
+ * MyMyeloma Backend — v3
+ * Fix: "DECODER routines::unsupported"
+ * Solution: Build JWT + call Google APIs manually using node:crypto
+ *           (bypasses googleapis library entirely — no OpenSSL issues)
  */
 
-const express    = require('express');
-const cors       = require('cors');
-const { google } = require('googleapis');
+'use strict';
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const express = require('express');
+const crypto  = require('crypto');
+const https   = require('https');
+const app     = express();
+const PORT    = process.env.PORT || 3000;
 
-// ─── PRIVATE KEY FIX ─────────────────────────────────────────────
-// Render stores env vars as single-line strings.
-// The private key needs real newlines, not literal \n characters.
-function fixPrivateKey(key) {
-  if (!key) return '';
-  // If key already has real newlines, return as-is
-  if (key.includes('\n') && !key.includes('\\n')) return key;
-  // Replace literal \n with real newlines
-  return key.replace(/\\n/g, '\n');
+// ─── ENV VARS ─────────────────────────────────────────────────────
+function fixKey(k) {
+  if (!k) return '';
+  return k.replace(/\\n/g, '\n').trim();
 }
 
-const PRIVATE_KEY    = fixPrivateKey(process.env.GOOGLE_PRIVATE_KEY || '');
-const CLIENT_EMAIL   = process.env.GOOGLE_CLIENT_EMAIL || '';
-const DRIVE_FOLDER   = process.env.DRIVE_FOLDER_ID     || '';
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGINS     || '*';
+const CLIENT_EMAIL   = (process.env.GOOGLE_CLIENT_EMAIL || '').trim();
+const PRIVATE_KEY    = fixKey(process.env.GOOGLE_PRIVATE_KEY || '');
+const DRIVE_FOLDER   = (process.env.DRIVE_FOLDER_ID  || '').trim();
+const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGINS  || '*').trim();
 
-// ─── MIDDLEWARES ──────────────────────────────────────────────────
-app.use(cors({
-  origin: (origin, cb) => {
-    // Allow configured origins + localhost for dev
-    const allowed = ALLOWED_ORIGIN.split(',').map(s => s.trim());
-    if (!origin || allowed.includes('*') || allowed.includes(origin) || origin.includes('localhost')) {
-      cb(null, true);
-    } else {
-      cb(new Error('CORS: Origin not allowed — ' + origin));
-    }
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+// ─── CORS ─────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const origin  = req.headers.origin || '';
+  const allowed = ALLOWED_ORIGIN.split(',').map(s => s.trim());
+  const ok = !origin
+    || allowed.includes('*')
+    || allowed.some(o => origin.startsWith(o))
+    || origin.includes('localhost');
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+  if (ok) res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-// ─── GOOGLE AUTH ──────────────────────────────────────────────────
-function getAuth() {
-  if (!CLIENT_EMAIL || !PRIVATE_KEY) {
-    throw new Error('Google credentials not configured in environment variables');
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+// ─── JWT BUILDER ──────────────────────────────────────────────────
+function b64url(str) {
+  return Buffer.from(typeof str === 'string' ? str : JSON.stringify(str))
+    .toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function makeJWT(email, pemKey, scopes) {
+  const now = Math.floor(Date.now() / 1000);
+  const hdr = b64url({ alg: 'RS256', typ: 'JWT' });
+  const pay = b64url({
+    iss:   email,
+    scope: Array.isArray(scopes) ? scopes.join(' ') : scopes,
+    aud:   'https://oauth2.googleapis.com/token',
+    iat:   now,
+    exp:   now + 3600
+  });
+  const data   = hdr + '.' + pay;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(data);
+  signer.end();
+  const sig = signer.sign(pemKey)
+    .toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return data + '.' + sig;
+}
+
+// ─── OAUTH TOKEN ──────────────────────────────────────────────────
+const tokenCache = { token: null, exp: 0 };
+
+async function getToken() {
+  if (tokenCache.token && Date.now() < tokenCache.exp - 300000) {
+    return tokenCache.token;
   }
-  return new google.auth.JWT({
-    email: CLIENT_EMAIL,
-    key:   PRIVATE_KEY,
-    scopes: ['https://www.googleapis.com/auth/drive']
+  const jwt  = makeJWT(CLIENT_EMAIL, PRIVATE_KEY, ['https://www.googleapis.com/auth/drive']);
+  const body = `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`;
+  const data = await post('oauth2.googleapis.com', '/token', body, {
+    'Content-Type': 'application/x-www-form-urlencoded'
+  });
+  if (!data.access_token) throw new Error('OAuth failed: ' + JSON.stringify(data));
+  tokenCache.token = data.access_token;
+  tokenCache.exp   = Date.now() + (data.expires_in || 3600) * 1000;
+  return tokenCache.token;
+}
+
+// ─── HTTP HELPERS ─────────────────────────────────────────────────
+function request(method, host, path, bodyBuf, headers) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: host, path, method,
+      headers: { 'Content-Length': bodyBuf ? bodyBuf.length : 0, ...headers }
+    };
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString();
+        if (res.statusCode >= 400) {
+          return reject(new Error(`HTTP ${res.statusCode} ${path}: ${raw.slice(0, 400)}`));
+        }
+        try { resolve(JSON.parse(raw)); }
+        catch { resolve(raw); }
+      });
+    });
+    req.on('error', reject);
+    if (bodyBuf) req.write(bodyBuf);
+    req.end();
   });
 }
 
-function getDrive() {
-  return google.drive({ version: 'v3', auth: getAuth() });
-}
-
-// ─── HELPER: Find or Create File ─────────────────────────────────
-async function findOrCreateFile(drive, folderId, fileName) {
-  // Search for existing file with this name in folder
-  const search = await drive.files.list({
-    q: `name='${fileName}' and '${folderId}' in parents and trashed=false`,
-    fields: 'files(id,name)',
-    spaces: 'drive'
+async function post(host, path, body, headers = {}) {
+  const buf = Buffer.from(body);
+  return request('POST', host, path, buf, {
+    'Content-Type': 'application/json', ...headers
   });
-  return search.data.files?.[0]?.id || null;
 }
 
-// ─── HELPER: Upsert JSON File ────────────────────────────────────
-async function upsertJsonFile(drive, folderId, fileName, content) {
-  const { Readable } = require('stream');
-  const jsonStr = JSON.stringify(content, null, 2);
+async function driveGet(token, path) {
+  return request('GET', 'www.googleapis.com', path, null, {
+    Authorization: 'Bearer ' + token
+  });
+}
 
-  // Wrap string in a Node.js readable stream
-  const toStream = (str) => {
-    const s = new Readable();
-    s.push(str);
-    s.push(null);
-    return s;
-  };
+// Multipart upload (create file with content in one request)
+function driveMultipart(token, method, path, meta, mediaBuf, mimeType) {
+  const bound = 'mymb_' + Date.now();
+  const parts  = Buffer.concat([
+    Buffer.from(`--${bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`),
+    Buffer.from(JSON.stringify(meta)),
+    Buffer.from(`\r\n--${bound}\r\nContent-Type: ${mimeType}\r\n\r\n`),
+    mediaBuf,
+    Buffer.from(`\r\n--${bound}--`)
+  ]);
+  return request(method, 'www.googleapis.com', path, parts, {
+    Authorization:  'Bearer ' + token,
+    'Content-Type': `multipart/related; boundary=${bound}`
+  });
+}
 
-  const existingId = await findOrCreateFile(drive, folderId, fileName);
+// Simple media-only PATCH (update content of existing file)
+function drivePatch(token, fileId, buf, mimeType) {
+  return request('PATCH', 'www.googleapis.com',
+    `/upload/drive/v3/files/${fileId}?uploadType=media`,
+    buf,
+    { Authorization: 'Bearer ' + token, 'Content-Type': mimeType }
+  );
+}
 
-  if (existingId) {
-    // Update existing file
-    const res = await drive.files.update({
-      fileId: existingId,
-      media: { mimeType: 'application/json', body: toStream(jsonStr) },
-      fields: 'id,webViewLink'
-    });
-    return { fileId: res.data.id, webViewLink: res.data.webViewLink, action: 'updated' };
-  } else {
-    // Create new file
-    const res = await drive.files.create({
-      requestBody: {
-        name: fileName,
-        parents: [folderId],
-        mimeType: 'application/json'
-      },
-      media: { mimeType: 'application/json', body: toStream(jsonStr) },
-      fields: 'id,webViewLink'
-    });
-    return { fileId: res.data.id, webViewLink: res.data.webViewLink, action: 'created' };
+// ─── DRIVE HELPERS ────────────────────────────────────────────────
+async function findFile(token, folderId, name) {
+  const q = encodeURIComponent(`name='${name.replace(/'/g,"\\'")}' and '${folderId}' in parents and trashed=false`);
+  const r = await driveGet(token, `/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`);
+  return r.files?.[0] || null;
+}
+
+async function upsertJSON(token, folderId, name, content) {
+  const buf      = Buffer.from(JSON.stringify(content, null, 2));
+  const existing = await findFile(token, folderId, name);
+
+  if (existing) {
+    const r = await drivePatch(token, existing.id, buf, 'application/json');
+    return { fileId: r.id || existing.id, action: 'updated', name };
   }
+
+  const r = await driveMultipart(
+    token, 'POST',
+    '/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink',
+    { name, parents: [folderId], mimeType: 'application/json' },
+    buf, 'application/json'
+  );
+  return { fileId: r.id, webViewLink: r.webViewLink, action: 'created', name };
 }
 
-// ─── ROUTES ──────────────────────────────────────────────────────
+// ─── ROUTES ───────────────────────────────────────────────────────
 
-// Health check
 app.get('/api/health', (req, res) => {
+  const lines = PRIVATE_KEY.split('\n').length;
   res.json({
-    status:    'ok',
-    timestamp: new Date().toISOString(),
-    drive:     !!CLIENT_EMAIL && !!PRIVATE_KEY,
-    folder:    DRIVE_FOLDER
+    status: 'ok',
+    time:   new Date().toISOString(),
+    node:   process.version,
+    creds:  { email: !!CLIENT_EMAIL, keyLines: lines, keyOk: lines >= 25 },
+    folder: DRIVE_FOLDER
   });
 });
 
-// Test Drive connection
 app.get('/api/drive/list', async (req, res) => {
   try {
-    const drive = getDrive();
-    const result = await drive.files.list({
-      q:      `'${DRIVE_FOLDER}' in parents and trashed=false`,
-      fields: 'files(id,name,modifiedTime,size)',
-      pageSize: 20
-    });
-    res.json({ success: true, files: result.data.files || [] });
+    const token = await getToken();
+    const q     = encodeURIComponent(`'${DRIVE_FOLDER}' in parents and trashed=false`);
+    const data  = await driveGet(token, `/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,size)&pageSize=20`);
+    res.json({ success: true, files: data.files || [], count: data.files?.length || 0 });
   } catch (e) {
-    console.error('[drive/list]', e.message);
+    console.error('[list]', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Upload / update a single user file
 app.post('/api/drive/upload', async (req, res) => {
   try {
-    const { userId, fileName, content, folderId } = req.body;
-    if (!fileName || !content) {
-      return res.status(400).json({ success: false, error: 'fileName and content are required' });
+    const { fileName, content, folderId } = req.body;
+    if (!fileName || content === undefined) {
+      return res.status(400).json({ success: false, error: 'fileName and content required' });
     }
-
-    const targetFolder = folderId || DRIVE_FOLDER;
-    const drive        = getDrive();
-    const safeContent  = { ...content, pass: undefined }; // never store passwords
-
-    const result = await upsertJsonFile(drive, targetFolder, fileName, safeContent);
-
+    const token  = await getToken();
+    const folder = folderId || DRIVE_FOLDER;
+    const safe   = { ...content, pass: undefined };
+    const result = await upsertJSON(token, folder, fileName, safe);
     res.json({
-      success:     true,
-      fileId:      result.fileId,
-      webViewLink: result.webViewLink,
-      action:      result.action,
-      message:     `تم ${result.action === 'updated' ? 'تحديث' : 'إنشاء'} ملف ${fileName} بنجاح ✓`
+      success: true, ...result,
+      message: `${result.action === 'updated' ? 'تحديث' : 'رفع'} ${fileName} ✓`
     });
   } catch (e) {
-    console.error('[drive/upload]', e.message);
+    console.error('[upload]', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Sync all users (admin bulk upload)
 app.post('/api/drive/sync-all', async (req, res) => {
   try {
     const { fileName, content, folderId } = req.body;
-    if (!content) return res.status(400).json({ success: false, error: 'content is required' });
+    if (!content) return res.status(400).json({ success: false, error: 'content required' });
 
-    const targetFolder = folderId || DRIVE_FOLDER;
-    const drive        = getDrive();
+    const token  = await getToken();
+    const folder = folderId || DRIVE_FOLDER;
+    const name   = fileName || `MM_AllUsers_${new Date().toISOString().split('T')[0]}.json`;
 
-    // Save the all_users file
-    const allFile = await upsertJsonFile(
-      drive, targetFolder,
-      fileName || `MM_AllUsers_${new Date().toISOString().split('T')[0]}.json`,
-      content
-    );
+    const master = await upsertJSON(token, folder, name, content);
 
-    // Also save individual files for each user
+    // Individual user files — batches of 5
+    const users   = Array.isArray(content) ? content : [];
     const results = [];
-    if (Array.isArray(content)) {
-      for (const user of content) {
-        try {
-          const r = await upsertJsonFile(
-            drive, targetFolder,
-            `user_${user.id}.json`,
-            { ...user, pass: undefined }
-          );
-          results.push({ id: user.id, name: user.name, fileId: r.fileId, ok: true });
-        } catch (e2) {
-          results.push({ id: user.id, name: user.name, error: e2.message, ok: false });
-        }
-      }
+    for (let i = 0; i < users.length; i += 5) {
+      const settled = await Promise.allSettled(
+        users.slice(i, i + 5).map(u =>
+          upsertJSON(token, folder, `user_${u.id}.json`, { ...u, pass: undefined })
+        )
+      );
+      settled.forEach((r, j) => {
+        const u = users[i + j];
+        results.push(r.status === 'fulfilled'
+          ? { id: u.id, name: u.name, ok: true }
+          : { id: u.id, name: u.name, ok: false, error: r.reason?.message });
+      });
     }
 
+    const ok  = results.filter(r => r.ok).length;
+    const bad = results.filter(r => !r.ok).length;
     res.json({
-      success:  true,
-      fileId:   allFile.fileId,
-      count:    Array.isArray(content) ? content.length : 1,
-      results,
-      message:  `تمت مزامنة ${Array.isArray(content) ? content.length : 1} مستخدم بنجاح ✓`
+      success: true, master,
+      total: users.length, synced: ok, failed: bad, results,
+      message: `تمت مزامنة ${ok}/${users.length} مستخدم ✓`
     });
   } catch (e) {
-    console.error('[drive/sync-all]', e.message);
+    console.error('[sync-all]', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Upload a file binary (PDF/image) to Drive
 app.post('/api/drive/upload-file', async (req, res) => {
   try {
-    // Use multer for multipart form
-    const multer = require('multer');
-    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+    const { name, mimeType, folderId, userId, base64 } = req.body;
+    if (!name || !base64) return res.status(400).json({ success: false, error: 'name and base64 required' });
 
-    upload.single('file')(req, res, async (err) => {
-      if (err) return res.status(400).json({ success: false, error: err.message });
-      if (!req.file) return res.status(400).json({ success: false, error: 'No file provided' });
+    const token  = await getToken();
+    const folder = folderId || DRIVE_FOLDER;
+    const buf    = Buffer.from(base64, 'base64');
+    const mime   = mimeType || 'application/octet-stream';
 
-      const { userId, fileId, folderId } = req.body;
-      const drive      = getDrive();
-      const targetFolder = folderId || DRIVE_FOLDER;
-
-      const { Readable } = require('stream');
-      const stream = new Readable();
-      stream.push(req.file.buffer);
-      stream.push(null);
-
-      const result = await drive.files.create({
-        requestBody: {
-          name:    req.file.originalname,
-          parents: [targetFolder],
-          appProperties: { userId, fileId }
-        },
-        media: { mimeType: req.file.mimetype, body: stream },
-        fields: 'id,webViewLink'
-      });
-
-      res.json({
-        success:     true,
-        fileId:      result.data.id,
-        webViewLink: result.data.webViewLink,
-        message:     'تم رفع الملف بنجاح ✓'
-      });
-    });
+    const r = await driveMultipart(
+      token, 'POST',
+      '/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink',
+      { name, parents: [folder], mimeType: mime, appProperties: { userId: userId || '' } },
+      buf, mime
+    );
+    res.json({ success: true, fileId: r.id, webViewLink: r.webViewLink });
   } catch (e) {
-    console.error('[drive/upload-file]', e.message);
+    console.error('[upload-file]', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // ─── START ────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🧬 MyMyeloma Backend running on port ${PORT}`);
+  const lines = PRIVATE_KEY.split('\n').length;
+  console.log(`🧬 MyMyeloma Backend v3 on port ${PORT}`);
   console.log(`📁 Drive Folder: ${DRIVE_FOLDER}`);
   console.log(`📧 Client Email: ${CLIENT_EMAIL}`);
-  console.log(`🔑 Private Key: ${PRIVATE_KEY ? 'LOADED ✓' : 'MISSING ✗'}`);
-  if (PRIVATE_KEY) {
-    const lines = PRIVATE_KEY.split('\n').length;
-    console.log(`   Key lines: ${lines} ${lines > 5 ? '✓' : '✗ (might be malformed)'}`);
-  }
+  console.log(`🔑 Private Key: ${PRIVATE_KEY ? 'LOADED ✓' : 'MISSING ✗'} (${lines} lines)`);
+  console.log(`🟢 Node: ${process.version} | No googleapis — pure crypto ⚡`);
 });
