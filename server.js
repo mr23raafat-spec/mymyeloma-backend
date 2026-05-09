@@ -10,6 +10,22 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+// =====================
+// 👤 Users storage (Auth)
+// =====================
+const fs = require('fs');
+
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+function loadUsers() {
+  if (!fs.existsSync(USERS_FILE)) return [];
+  return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+}
+
+function saveUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+}
+``
 
 // ✅ Security middleware
 app.use(cors({
@@ -204,6 +220,77 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// =====================
+// 📝 Register
+// =====================
+app.post('/api/auth/register', (req, res) => {
+  const { name, email, password, phone, hosp, doc } = req.body;
+
+  if (!name || !email || !password) {
+    return res.json({ success: false, message: 'بيانات ناقصة' });
+  }
+
+  const users = loadUsers();
+
+  if (users.find(u => u.email === email)) {
+    return res.json({ success: false, message: 'البريد مسجّل بالفعل' });
+  }
+
+  const user = {
+    id: 'U' + Date.now(),
+    name,
+    email,
+    phone,
+    hosp,
+    doc,
+    password: Buffer.from(password).toString('base64'),
+    createdAt: new Date().toISOString()
+  };
+
+  users.push(user);
+  saveUsers(users);
+
+  res.json({
+    success: true,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      hosp: user.hosp,
+      doc: user.doc
+    }
+  });
+});
+// =====================
+// 🔐 Login
+// =====================
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  const users = loadUsers();
+
+  const user = users.find(
+    u =>
+      u.email === email &&
+      Buffer.from(u.password, 'base64').toString() === password
+  );
+
+  if (!user) {
+    return res.json({ success: false, message: 'بيانات غير صحيحة' });
+  }
+
+  res.json({
+    success: true,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      hosp: user.hosp,
+      doc: user.doc
+    }
+  });
+});
 // ═══════════════════════════════════════════════════════════════
 // 🚀 START SERVER
 // ═══════════════════════════════════════════════════════════════
