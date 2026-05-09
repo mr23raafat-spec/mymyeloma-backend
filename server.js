@@ -61,8 +61,6 @@ const drive = google.drive({
   auth
 });
 
-const drive = google.drive({ version: 'v3', auth });
-
 const FOLDER_ID = process.env.DRIVE_FOLDER_ID;
 
 // ═══════════════════════════════════════════════════════════════
