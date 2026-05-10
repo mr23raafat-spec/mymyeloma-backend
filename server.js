@@ -18,6 +18,7 @@ const PORT    = process.env.PORT || 3000;
 const ADMIN_CODE  = process.env.ADMIN_CODE || 'MyMyeloma@2025';
 const FOLDER_ID   = (process.env.DRIVE_FOLDER_ID || '').trim();
 const ALLOWED     = (process.env.ALLOWED_ORIGINS || '*').trim();
+const RESEND_KEY  = (process.env.RESEND_API_KEY  || '').trim(); // resend.com free key
 
 // ─── CREDENTIALS ─────────────────────────────────────────────────
 function loadCreds() {
@@ -175,6 +176,13 @@ async function sheetsClearRow(token, rowIdx) {
     `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!A${rowIdx}:J${rowIdx}`)}:clear`,{});
 }
 
+// Clear a full range (e.g. '2:2000')
+async function sheetsClearRange(token, range) {
+  const sid = await getSheetId(token);
+  return gApi(token,'POST','sheets.googleapis.com',
+    `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!A${range}:J${range}`)}:clear`,{});
+}
+
 function rowToUser(row) {
   if (!row?.[0]) return null;
   const u = {};
@@ -232,6 +240,96 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+
+// ─── IN-MEMORY OTP STORE (10 min expiry) ─────────────────────────────────
+const otpStore = new Map(); // email → { code, exp }
+
+// ─── EMAIL via Resend API ──────────────────────────────────────────────────
+async function sendEmail(to, subject, html) {
+  if (!RESEND_KEY) { console.warn('⚠️ RESEND_API_KEY missing — email not sent'); return false; }
+  const body = Buffer.from(JSON.stringify({
+    from: 'MyMyeloma Care <onboarding@resend.dev>',
+    to:   [to], subject, html
+  }));
+  const res = await new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'api.resend.com', path: '/emails', method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_KEY}`,
+                 'Content-Type': 'application/json', 'Content-Length': body.length }
+    }, resp => {
+      const cs = []; resp.on('data', c => cs.push(c));
+      resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(cs).toString() }));
+    });
+    req.on('error', reject); req.write(body); req.end();
+  });
+  console.log(`📧 Email to ${to}: HTTP ${res.status}`);
+  return res.status < 300;
+}
+
+// Forgot password — generate OTP, send email
+app.post('/api/users/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, error: 'email required' });
+
+    const token = await getToken();
+    const found = await findUserByEmail(token, email);
+    if (!found) return res.status(404).json({ success: false, error: 'البريد غير مسجّل' });
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    otpStore.set(email, { code, exp: Date.now() + 10 * 60 * 1000 });
+
+    const sent = await sendEmail(email, '🔑 رمز استعادة كلمة السر — MyMyeloma Care', `
+      <div dir="rtl" style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border-radius:12px;border:1px solid #eee">
+        <h2 style="color:#1a73e8">MyMyeloma Care 🧬</h2>
+        <p>مرحباً ${found.user.name}،</p>
+        <p>طلبت استعادة كلمة السر. رمز التحقق الخاص بك:</p>
+        <div style="font-size:36px;font-weight:bold;letter-spacing:8px;text-align:center;padding:20px;background:#f0f4ff;border-radius:8px;color:#1a73e8">${code}</div>
+        <p style="color:#666;font-size:13px">صالح لمدة 10 دقائق فقط. لا تشاركه مع أحد.</p>
+        <hr/><p style="color:#999;font-size:11px">MyMyeloma Care — رعايتك الصحية في يدك</p>
+      </div>
+    `);
+
+    if (sent) {
+      res.json({ success: true, message: `تم إرسال الرمز إلى ${email}` });
+    } else {
+      // Fallback: return code in response (dev mode — no email key configured)
+      res.json({ success: true, message: 'تم إنشاء الرمز', resetCode: code });
+    }
+  } catch (e) {
+    console.error('[forgot-password]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Reset password — verify OTP, update hash in sheet
+app.post('/api/users/reset-password', async (req, res) => {
+  try {
+    const { email, resetCode, newPassHash } = req.body;
+    if (!email || !resetCode || !newPassHash)
+      return res.status(400).json({ success: false, error: 'email, resetCode, newPassHash required' });
+
+    const otp = otpStore.get(email);
+    if (!otp || otp.code !== resetCode || Date.now() > otp.exp)
+      return res.status(401).json({ success: false, error: 'رمز التحقق غير صحيح أو منتهي الصلاحية' });
+
+    otpStore.delete(email);
+    const token  = await getToken();
+    const found  = await findUserByEmail(token, email);
+    if (!found) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+
+    const { user, rowIdx } = found;
+    user.passHash = newPassHash;
+    const row = userToRow(user);
+    await sheetsWrite(token, `${SHEET}!A${rowIdx}:J${rowIdx}`, [row]);
+
+    res.json({ success: true, message: 'تم تغيير كلمة السر بنجاح ✓' });
+  } catch (e) {
+    console.error('[reset-password]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Admin login
 app.post('/api/admin/verify', (req, res) => {
   const { code } = req.body;
@@ -277,119 +375,19 @@ app.post('/api/users/login', async (req, res) => {
 
     let user = null;
     for (const row of rows) {
-      // col[1]=name, col[2]=email — match either
       if (row[2]===identifier || row[1]===identifier) {
         user = rowToUser(row); break;
       }
     }
 
     if (!user) return res.status(401).json({success:false,error:'المستخدم غير موجود'});
-
-    // stored hash is in col[8] — could be named 'passHash' or 'pass' after rowToUser
-    const storedHash = user.passHash || user.pass || '';
-    if (storedHash !== passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
+    if (user.passHash!==passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
     if (user.status==='blocked') return res.status(403).json({success:false,error:'الحساب محظور'});
 
     const safeUser = {...user, passHash:undefined, pass:undefined};
     res.json({success:true, user:safeUser, message:'مرحباً بك ✓'});
   } catch(e) {
     console.error('[login]', e.message);
-    res.status(500).json({success:false, error:e.message});
-  }
-});
-
-// Forgot password — send reset token via email (stored in sheet)
-app.post('/api/users/forgot-password', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({success:false,error:'email required'});
-    const token = await getToken();
-    const found = await findUserByEmail(token, email);
-    if (!found) return res.status(404).json({success:false,error:'البريد غير مسجّل'});
-
-    // Generate a 6-digit reset code + expiry (1 hour)
-    const resetCode    = Math.floor(100000 + Math.random() * 900000).toString();
-    const resetExpiry  = new Date(Date.now() + 3600000).toISOString();
-    const resetHash    = crypto.createHash('sha256').update(resetCode).digest('hex');
-
-    // Store reset token in the data column
-    const rowIdx = found.rowIdx;
-    const existingData = found.user.data ? JSON.parse(found.user.data||'{}') : {};
-    const updatedData  = JSON.stringify({...existingData, resetHash, resetExpiry});
-    const sid = await getSheetId(token);
-    await gApi(token,'PUT','sheets.googleapis.com',
-      `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!J${rowIdx}`)}?valueInputOption=RAW`,
-      {range:`${SHEET}!J${rowIdx}`, majorDimension:'ROWS', values:[[updatedData]]});
-
-    // Return code in response (in production: send via SMS/email)
-    // For now we return it so admin can relay it to user
-    console.log(`🔑 Reset code for ${email}: ${resetCode}`);
-    res.json({
-      success:true,
-      message:'تم إنشاء رمز إعادة التعيين',
-      // In dev/demo mode: return code directly. In prod: remove this and send via SMS
-      resetCode,
-      note:'احفظ هذا الرمز — صالح لمدة ساعة واحدة'
-    });
-  } catch(e) {
-    console.error('[forgot-password]', e.message);
-    res.status(500).json({success:false, error:e.message});
-  }
-});
-
-// Reset password with code
-app.post('/api/users/reset-password', async (req, res) => {
-  try {
-    const { email, resetCode, newPassHash } = req.body;
-    if (!email||!resetCode||!newPassHash) return res.status(400).json({success:false,error:'email, resetCode, newPassHash required'});
-
-    const token = await getToken();
-    const found = await findUserByEmail(token, email);
-    if (!found) return res.status(404).json({success:false,error:'البريد غير مسجّل'});
-
-    const u = found.user;
-    let userData = {};
-    try { userData = JSON.parse(u.data||'{}'); } catch {}
-
-    const codeHash = crypto.createHash('sha256').update(resetCode).digest('hex');
-    if (!userData.resetHash || userData.resetHash !== codeHash)
-      return res.status(400).json({success:false,error:'رمز التحقق غير صحيح'});
-    if (new Date(userData.resetExpiry) < new Date())
-      return res.status(400).json({success:false,error:'انتهت صلاحية الرمز — اطلب رمزاً جديداً'});
-
-    // Update password and clear reset token
-    delete userData.resetHash; delete userData.resetExpiry;
-    const rowIdx = found.rowIdx;
-    const sid    = await getSheetId(token);
-    // Update passHash col (I = col 9) and data col (J = col 10)
-    await sheetsWrite(token, `${SHEET}!I${rowIdx}:J${rowIdx}`,
-      [[newPassHash, JSON.stringify(userData)]]);
-
-    res.json({success:true, message:'تم تغيير كلمة السر بنجاح ✓'});
-  } catch(e) {
-    console.error('[reset-password]', e.message);
-    res.status(500).json({success:false, error:e.message});
-  }
-});
-
-// Get user full data (for restore)
-app.post('/api/users/restore', async (req, res) => {
-  try {
-    const { identifier, passHash } = req.body;
-    if (!identifier||!passHash) return res.status(400).json({success:false,error:'identifier and passHash required'});
-    const token = await getToken();
-    const rows  = await sheetsRead(token, `${SHEET}!A2:J2000`);
-    let user = null;
-    for (const row of rows) {
-      if (row[2]===identifier || row[1]===identifier) { user = rowToUser(row); break; }
-    }
-    if (!user) return res.status(401).json({success:false,error:'المستخدم غير موجود'});
-    const storedHash = user.passHash || user.pass || '';
-    if (storedHash !== passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
-    const safeUser = {...user, passHash:undefined, pass:undefined};
-    res.json({success:true, user:safeUser, message:'تم استرداد البيانات ✓'});
-  } catch(e) {
-    console.error('[restore]', e.message);
     res.status(500).json({success:false, error:e.message});
   }
 });
@@ -461,7 +459,9 @@ app.post('/api/drive/sync-all', async (req, res) => {
     const { content } = req.body;
     const users = Array.isArray(content) ? content : [];
     const token = await getToken();
-    await sheetsClearRow(token, '2:2000'); // clear data rows
+    const sid2 = await getSheetId(token);
+    await gApi(token,'POST','sheets.googleapis.com',
+      `/v4/spreadsheets/${sid2}/values/${encodeURIComponent(`${SHEET}!A2:J2000`)}:clear`,{}); // clear data rows
     if (users.length) await sheetsAppend(token, users.map(u=>userToRow({...u})));
     res.json({success:true, count:users.length, message:`تمت مزامنة ${users.length} مستخدم ✓`});
   } catch(e) {
@@ -503,6 +503,102 @@ app.get('/api/drive/list', async (req, res) => {
   } catch(e) {
     console.error('[list]', e.message);
     res.status(500).json({success:false, error:e.message});
+  }
+});
+
+
+// ─── GOOGLE DRIVE FILE STORAGE ────────────────────────────────────────────
+
+// Upload file to Drive (base64 encoded)
+app.post('/api/drive/file-upload', async (req, res) => {
+  try {
+    const { fileName, mimeType, base64Data, userId } = req.body;
+    if (!base64Data || !fileName) return res.status(400).json({ success: false, error: 'fileName and base64Data required' });
+    if (!FOLDER_ID) return res.status(503).json({ success: false, error: 'DRIVE_FOLDER_ID غير مضبوط في البيئة' });
+
+    const token  = await getToken();
+    const buffer = Buffer.from(base64Data, 'base64');
+    const mime   = mimeType || 'application/octet-stream';
+
+    // Multipart upload to Drive
+    const boundary = '-------mm_boundary_' + Date.now();
+    const metaPart = JSON.stringify({ name: fileName, parents: [FOLDER_ID] });
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metaPart}\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`),
+      buffer,
+      Buffer.from(`\r\n--${boundary}--`)
+    ]);
+
+    const d = await new Promise((resolve, reject) => {
+      const rq = https.request({
+        hostname: 'www.googleapis.com',
+        path: '/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`,
+          'Content-Length': body.length
+        }
+      }, resp => {
+        const cs = []; resp.on('data', c => cs.push(c));
+        resp.on('end', () => {
+          const raw = Buffer.concat(cs).toString();
+          if (resp.statusCode >= 400) return reject(new Error(`Drive upload HTTP ${resp.statusCode}: ${raw.slice(0,300)}`));
+          try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
+        });
+      });
+      rq.on('error', reject); rq.write(body); rq.end();
+    });
+
+    console.log(`📁 File uploaded: ${d.id} (${fileName}) by user ${userId||'?'}`);
+    res.json({ success: true, fileId: d.id, fileName: d.name, viewLink: d.webViewLink });
+  } catch (e) {
+    console.error('[file-upload]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Download/proxy file from Drive
+app.get('/api/drive/file/:fileId', async (req, res) => {
+  try {
+    const token = await getToken();
+    const { fileId } = req.params;
+
+    // Get file metadata first
+    const meta = await gApi(token, 'GET', 'www.googleapis.com',
+      `/drive/v3/files/${fileId}?fields=name,mimeType,size`);
+
+    // Stream the file
+    const pr = new Promise((resolve, reject) => {
+      https.get({
+        hostname: 'www.googleapis.com',
+        path: `/drive/v3/files/${fileId}?alt=media`,
+        headers: { 'Authorization': `Bearer ${token}` }
+      }, resp => {
+        res.setHeader('Content-Type', meta.mimeType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(meta.name || fileId)}"`);
+        if (meta.size) res.setHeader('Content-Length', meta.size);
+        resp.pipe(res);
+        resp.on('end', resolve); resp.on('error', reject);
+      }).on('error', reject);
+    });
+    await pr;
+  } catch (e) {
+    console.error('[file-download]', e.message);
+    if (!res.headersSent) res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Delete file from Drive
+app.delete('/api/drive/file/:fileId', async (req, res) => {
+  try {
+    const token = await getToken();
+    await gApi(token, 'DELETE', 'www.googleapis.com', `/drive/v3/files/${req.params.fileId}`, null);
+    res.json({ success: true, message: 'تم حذف الملف ✓' });
+  } catch (e) {
+    console.error('[file-delete]', e.message);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
