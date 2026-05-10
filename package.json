@@ -1,14 +1,10 @@
 {
   "name": "mymyeloma-backend",
-  "version": "3.0.0",
-  "description": "MyMyeloma Care Backend — pure node:crypto, no googleapis",
+  "version": "5.0.0",
+  "description": "MyMyeloma Care — Google Sheets DB, pure node:crypto",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18.0.0" },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5"
