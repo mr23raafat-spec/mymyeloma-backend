@@ -196,7 +196,10 @@ function userToRow(u) {
   const extra = {
     labs: u.labs||[], chemo: u.chemo||[],
     meds: u.meds||[], visits: u.visits||[],
-    files: (u.files||[]).map(f=>({id:f.id,name:f.name,type:f.type,size:f.size,uploadedAt:f.uploadedAt})),
+    files: (u.files||[]).map(f=>({id:f.id,name:f.name,type:f.type,size:f.size,uploadedAt:f.uploadedAt,driveFileId:f.driveFileId,driveLink:f.driveLink})),
+    symptoms: u.symptoms||[], vitals: u.vitals||[],
+    medLogs: (u.medLogs||[]).slice(-500), // keep last 500 entries
+    shareCode: u.shareCode||'',
     settings: u.settings||{}, lastSync: u.lastSync||''
   };
   return [
@@ -223,7 +226,7 @@ async function findUserRowIdx(token, userId) {
 async function findUserByEmail(token, email) {
   const rows = await sheetsRead(token, `${SHEET}!A2:J2000`);
   for (const row of rows) {
-    if (row[2]===email) return { user: rowToUser(row), rowIdx: rows.indexOf(row)+2 };
+    if (row[2]?.toLowerCase()===email?.toLowerCase()) return { user: rowToUser(row), rowIdx: rows.indexOf(row)+2 };
   }
   return null;
 }
@@ -375,7 +378,7 @@ app.post('/api/users/login', async (req, res) => {
 
     let user = null;
     for (const row of rows) {
-      if (row[2]===identifier || row[1]===identifier) {
+      if (row[2]?.toLowerCase()===identifier?.toLowerCase() || row[1]?.toLowerCase()===identifier?.toLowerCase()) {
         user = rowToUser(row); break;
       }
     }
