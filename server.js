@@ -173,15 +173,6 @@ async function sheetsClearRow(token, rowIdx) {
   const sid = await getSheetId(token);
   return gApi(token,'POST','sheets.googleapis.com',
     `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!A${rowIdx}:J${rowIdx}`)}:clear`,{});
-  return gApi(
-    token,
-    'POST',
-    'sheets.googleapis.com',
-    `/v4/spreadsheets/${sid}/values/${encodeURIComponent(
-      `Users!A${rowIdx}:J${rowIdx}`
-    )}:clear`,
-    {}
-  );
 }
 
 function rowToUser(row) {
@@ -286,19 +277,119 @@ app.post('/api/users/login', async (req, res) => {
 
     let user = null;
     for (const row of rows) {
+      // col[1]=name, col[2]=email — match either
       if (row[2]===identifier || row[1]===identifier) {
         user = rowToUser(row); break;
       }
     }
 
     if (!user) return res.status(401).json({success:false,error:'المستخدم غير موجود'});
-    if (user.passHash!==passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
+
+    // stored hash is in col[8] — could be named 'passHash' or 'pass' after rowToUser
+    const storedHash = user.passHash || user.pass || '';
+    if (storedHash !== passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
     if (user.status==='blocked') return res.status(403).json({success:false,error:'الحساب محظور'});
 
     const safeUser = {...user, passHash:undefined, pass:undefined};
     res.json({success:true, user:safeUser, message:'مرحباً بك ✓'});
   } catch(e) {
     console.error('[login]', e.message);
+    res.status(500).json({success:false, error:e.message});
+  }
+});
+
+// Forgot password — send reset token via email (stored in sheet)
+app.post('/api/users/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({success:false,error:'email required'});
+    const token = await getToken();
+    const found = await findUserByEmail(token, email);
+    if (!found) return res.status(404).json({success:false,error:'البريد غير مسجّل'});
+
+    // Generate a 6-digit reset code + expiry (1 hour)
+    const resetCode    = Math.floor(100000 + Math.random() * 900000).toString();
+    const resetExpiry  = new Date(Date.now() + 3600000).toISOString();
+    const resetHash    = crypto.createHash('sha256').update(resetCode).digest('hex');
+
+    // Store reset token in the data column
+    const rowIdx = found.rowIdx;
+    const existingData = found.user.data ? JSON.parse(found.user.data||'{}') : {};
+    const updatedData  = JSON.stringify({...existingData, resetHash, resetExpiry});
+    const sid = await getSheetId(token);
+    await gApi(token,'PUT','sheets.googleapis.com',
+      `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!J${rowIdx}`)}?valueInputOption=RAW`,
+      {range:`${SHEET}!J${rowIdx}`, majorDimension:'ROWS', values:[[updatedData]]});
+
+    // Return code in response (in production: send via SMS/email)
+    // For now we return it so admin can relay it to user
+    console.log(`🔑 Reset code for ${email}: ${resetCode}`);
+    res.json({
+      success:true,
+      message:'تم إنشاء رمز إعادة التعيين',
+      // In dev/demo mode: return code directly. In prod: remove this and send via SMS
+      resetCode,
+      note:'احفظ هذا الرمز — صالح لمدة ساعة واحدة'
+    });
+  } catch(e) {
+    console.error('[forgot-password]', e.message);
+    res.status(500).json({success:false, error:e.message});
+  }
+});
+
+// Reset password with code
+app.post('/api/users/reset-password', async (req, res) => {
+  try {
+    const { email, resetCode, newPassHash } = req.body;
+    if (!email||!resetCode||!newPassHash) return res.status(400).json({success:false,error:'email, resetCode, newPassHash required'});
+
+    const token = await getToken();
+    const found = await findUserByEmail(token, email);
+    if (!found) return res.status(404).json({success:false,error:'البريد غير مسجّل'});
+
+    const u = found.user;
+    let userData = {};
+    try { userData = JSON.parse(u.data||'{}'); } catch {}
+
+    const codeHash = crypto.createHash('sha256').update(resetCode).digest('hex');
+    if (!userData.resetHash || userData.resetHash !== codeHash)
+      return res.status(400).json({success:false,error:'رمز التحقق غير صحيح'});
+    if (new Date(userData.resetExpiry) < new Date())
+      return res.status(400).json({success:false,error:'انتهت صلاحية الرمز — اطلب رمزاً جديداً'});
+
+    // Update password and clear reset token
+    delete userData.resetHash; delete userData.resetExpiry;
+    const rowIdx = found.rowIdx;
+    const sid    = await getSheetId(token);
+    // Update passHash col (I = col 9) and data col (J = col 10)
+    await sheetsWrite(token, `${SHEET}!I${rowIdx}:J${rowIdx}`,
+      [[newPassHash, JSON.stringify(userData)]]);
+
+    res.json({success:true, message:'تم تغيير كلمة السر بنجاح ✓'});
+  } catch(e) {
+    console.error('[reset-password]', e.message);
+    res.status(500).json({success:false, error:e.message});
+  }
+});
+
+// Get user full data (for restore)
+app.post('/api/users/restore', async (req, res) => {
+  try {
+    const { identifier, passHash } = req.body;
+    if (!identifier||!passHash) return res.status(400).json({success:false,error:'identifier and passHash required'});
+    const token = await getToken();
+    const rows  = await sheetsRead(token, `${SHEET}!A2:J2000`);
+    let user = null;
+    for (const row of rows) {
+      if (row[2]===identifier || row[1]===identifier) { user = rowToUser(row); break; }
+    }
+    if (!user) return res.status(401).json({success:false,error:'المستخدم غير موجود'});
+    const storedHash = user.passHash || user.pass || '';
+    if (storedHash !== passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
+    const safeUser = {...user, passHash:undefined, pass:undefined};
+    res.json({success:true, user:safeUser, message:'تم استرداد البيانات ✓'});
+  } catch(e) {
+    console.error('[restore]', e.message);
     res.status(500).json({success:false, error:e.message});
   }
 });
