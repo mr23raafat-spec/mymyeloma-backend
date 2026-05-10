@@ -171,8 +171,15 @@ async function sheetsAppend(token, values) {
 
 async function sheetsClearRow(token, rowIdx) {
   const sid = await getSheetId(token);
-  return gApi(token,'POST','sheets.googleapis.com',
-    `/v4/spreadsheets/${sid}/values/${encodeURIComponent(`${SHEET}!A${rowIdx}:J${rowIdx}`)}:clear`,{});
+  return gApi(
+    token,
+    'POST',
+    'sheets.googleapis.com',
+    `/v4/spreadsheets/${sid}/values/${encodeURIComponent(
+      `Users!A${rowIdx}:J${rowIdx}`
+    )}:clear`,
+    {}
+  );
 }
 
 function rowToUser(row) {
