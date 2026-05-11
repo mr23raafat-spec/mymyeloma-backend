@@ -201,7 +201,7 @@ function userToRow(u) {
   const extra = {
     labs: u.labs||[], chemo: u.chemo||[],
     meds: u.meds||[], visits: u.visits||[],
-    files: (u.files||[]).map(f=>({id:f.id,name:f.name,type:f.type,size:f.size,uploadedAt:f.uploadedAt,driveFileId:f.driveFileId,driveLink:f.driveLink})),
+    files: (u.files||[]).map(f=>({id:f.id,name:f.name,type:f.type,desc:f.desc||'',size:f.size,uploadedAt:f.uploadedAt,driveFileId:f.driveFileId,driveLink:f.driveLink})),
     symptoms: u.symptoms||[], vitals: u.vitals||[],
     medLogs: (u.medLogs||[]).slice(-500), // keep last 500 entries
     shareCode: u.shareCode||'',
