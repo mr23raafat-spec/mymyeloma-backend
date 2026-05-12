@@ -609,10 +609,13 @@ function cldRequest(method, path, body) {
 // Upload file to Cloudinary (base64)
 app.post('/api/drive/file-upload', async (req, res) => {
   try {
-    const { fileName, mimeType, base64Data, userId } = req.body;
-    if (!base64Data || !fileName) return res.status(400).json({ success: false, error: 'fileName and base64Data required' });
+    const { fileName, mimeType, base64Data: rawBase64, userId } = req.body;
+    if (!rawBase64 || !fileName) return res.status(400).json({ success: false, error: 'fileName and base64Data required' });
     if (!CLD_CLOUD || !CLD_KEY || !CLD_SECRET)
       return res.status(503).json({ success: false, error: 'Cloudinary غير مضبوط في البيئة' });
+
+    // ✅ شيل الـ data URI prefix لو موجود (مثل: data:image/png;base64,...)
+    const base64Data = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
 
     const timestamp  = Math.floor(Date.now() / 1000);
     const publicId   = `mymyeloma/${userId || 'u'}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
