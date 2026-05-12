@@ -640,24 +640,28 @@ app.post('/api/drive/file-upload', async (req, res) => {
 app.get('/api/drive/file/:fileId(*)', async (req, res) => {
   try {
     const publicId = req.params.fileId;
-    const isImage  = /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
-    const isPDF    = /\.pdf$/i.test(publicId) || publicId.includes('.pdf');
+    // mime param from frontend (most reliable)
+    const mimeParam = req.query.mime || '';
+    const isImage   = mimeParam.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
     const resourceType = isImage ? 'image' : 'raw';
     const url = `https://res.cloudinary.com/${CLD_CLOUD}/${resourceType}/upload/${publicId}`;
 
-    // اضبط الـ Content-Type الصح
-    let contentType = 'application/octet-stream';
-    if (isPDF)   contentType = 'application/pdf';
-    else if (/\.png$/i.test(publicId))  contentType = 'image/png';
-    else if (/\.(jpg|jpeg)$/i.test(publicId)) contentType = 'image/jpeg';
-
-    // اسم الملف من آخر جزء في الـ publicId
-    const rawName = publicId.split('/').pop() || 'file';
-    const fileName = decodeURIComponent(rawName);
+    const contentType = mimeParam || (isImage ? 'image/jpeg' : 'application/pdf');
+    const fileName    = publicId.split('/').pop() || 'file';
 
     https.get(url, remote => {
-      const finalType = remote.headers['content-type'] || contentType;
-      res.setHeader('Content-Type', finalType);
+      if (remote.statusCode === 404) {
+        // جرب الـ resource type التاني لو 404
+        const fallbackType = isImage ? 'raw' : 'image';
+        const fallbackUrl  = `https://res.cloudinary.com/${CLD_CLOUD}/${fallbackType}/upload/${publicId}`;
+        https.get(fallbackUrl, r2 => {
+          res.setHeader('Content-Type', mimeParam || r2.headers['content-type'] || 'application/octet-stream');
+          res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+          r2.pipe(res);
+        }).on('error', () => res.status(404).end());
+        return;
+      }
+      res.setHeader('Content-Type', mimeParam || remote.headers['content-type'] || contentType);
       res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
       if (remote.headers['content-length'])
         res.setHeader('Content-Length', remote.headers['content-length']);
