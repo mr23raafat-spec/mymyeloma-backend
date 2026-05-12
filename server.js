@@ -389,12 +389,16 @@ app.post('/api/users/login', async (req, res) => {
     const token = await getToken();
     const rows  = await sheetsRead(token, `${SHEET}!A2:J2000`);
 
-    // ✅ FIX: normalize قبل المقارنة
+    // ✅ بحث بالإيميل أولاً (الأثبت)، ثم بالاسم للتوافق مع القديم
     const id = identifier.toLowerCase().trim();
     let user = null;
     for (const row of rows) {
-      if (row[2]?.toLowerCase().trim()===id || row[1]?.toLowerCase().trim()===id) {
-        user = rowToUser(row); break;
+      if (row[2]?.toLowerCase().trim() === id) { user = rowToUser(row); break; }
+    }
+    // fallback: بحث بالاسم (للحسابات القديمة)
+    if (!user) {
+      for (const row of rows) {
+        if (row[1]?.toLowerCase().trim() === id) { user = rowToUser(row); break; }
       }
     }
 
@@ -407,6 +411,20 @@ app.post('/api/users/login', async (req, res) => {
   } catch(e) {
     console.error('[login]', e.message);
     res.status(500).json({success:false, error:e.message});
+  }
+});
+
+// Get single user by ID (for cross-device sync)
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    const token = await getToken();
+    const rows  = await sheetsRead(token, `${SHEET}!A2:J2000`);
+    const user  = rows.map(rowToUser).find(u => u?.id === req.params.id);
+    if (!user) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+    res.json({ success: true, user: { ...user, passHash: undefined, pass: undefined } });
+  } catch (e) {
+    console.error('[user-get]', e.message);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -621,18 +639,30 @@ app.post('/api/drive/file-upload', async (req, res) => {
 // Proxy/download file from Cloudinary
 app.get('/api/drive/file/:fileId(*)', async (req, res) => {
   try {
-    // fileId is the public_id — build the Cloudinary URL
     const publicId = req.params.fileId;
-    // Determine resource type from extension
-    const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
+    const isImage  = /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
+    const isPDF    = /\.pdf$/i.test(publicId) || publicId.includes('.pdf');
     const resourceType = isImage ? 'image' : 'raw';
     const url = `https://res.cloudinary.com/${CLD_CLOUD}/${resourceType}/upload/${publicId}`;
 
+    // اضبط الـ Content-Type الصح
+    let contentType = 'application/octet-stream';
+    if (isPDF)   contentType = 'application/pdf';
+    else if (/\.png$/i.test(publicId))  contentType = 'image/png';
+    else if (/\.(jpg|jpeg)$/i.test(publicId)) contentType = 'image/jpeg';
+
+    // اسم الملف من آخر جزء في الـ publicId
+    const rawName = publicId.split('/').pop() || 'file';
+    const fileName = decodeURIComponent(rawName);
+
     https.get(url, remote => {
-      res.setHeader('Content-Type', remote.headers['content-type'] || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `inline; filename="${publicId.split('/').pop()}"`);
+      const finalType = remote.headers['content-type'] || contentType;
+      res.setHeader('Content-Type', finalType);
+      res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+      if (remote.headers['content-length'])
+        res.setHeader('Content-Length', remote.headers['content-length']);
       remote.pipe(res);
-      remote.on('error', e => { if(!res.headersSent) res.status(500).end(); });
+      remote.on('error', () => { if(!res.headersSent) res.status(500).end(); });
     }).on('error', e => { if(!res.headersSent) res.status(500).json({ error: e.message }); });
   } catch (e) {
     console.error('[file-download]', e.message);
