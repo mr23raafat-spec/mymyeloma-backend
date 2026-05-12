@@ -461,6 +461,33 @@ app.post('/api/users/update', async (req, res) => {
   }
 });
 
+// Admin reset password — sets a new passHash directly (no OTP needed)
+app.post('/api/admin/reset-password', async (req, res) => {
+  try {
+    const { adminCode, userId, newPassHash } = req.body;
+    if (!adminCode || !userId || !newPassHash)
+      return res.status(400).json({ success: false, error: 'adminCode, userId, newPassHash required' });
+    if (adminCode !== ADMIN_CODE)
+      return res.status(401).json({ success: false, error: 'رمز الأدمن غير صحيح' });
+
+    const token  = await getToken();
+    const rowIdx = await findUserRowIdx(token, userId);
+    if (rowIdx < 0) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+
+    const rows = await sheetsRead(token, `${SHEET}!A${rowIdx}:J${rowIdx}`);
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'صف غير موجود' });
+    const user = rowToUser(rows[0]);
+    user.passHash = newPassHash;
+    await sheetsWrite(token, `${SHEET}!A${rowIdx}:J${rowIdx}`, [userToRow(user)]);
+
+    console.log(`🔑 Admin reset password for userId: ${userId}`);
+    res.json({ success: true, message: 'تم تغيير كلمة السر بنجاح' });
+  } catch (e) {
+    console.error('[admin-reset-password]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Block / unblock
 app.post('/api/users/block', async (req, res) => {
   try {
@@ -603,8 +630,8 @@ app.post('/api/drive/file-upload', async (req, res) => {
       Buffer.from(addPart('timestamp', timestamp)),
       Buffer.from(addPart('public_id', publicId)),
       Buffer.from(addPart('signature', signature)),
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"\r\n\r\n`),
-      Buffer.from(`data:${mimeType || 'application/octet-stream'};base64,${base64Data}`),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
+      Buffer.from(base64Data, 'base64'),
       Buffer.from(`\r\n--${boundary}--`)
     ]);
 
