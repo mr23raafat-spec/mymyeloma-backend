@@ -18,7 +18,7 @@ const PORT    = process.env.PORT || 3000;
 const ADMIN_CODE  = process.env.ADMIN_CODE || 'MyMyeloma@2025';
 const FOLDER_ID   = (process.env.DRIVE_FOLDER_ID || '').trim();
 const ALLOWED     = (process.env.ALLOWED_ORIGINS ||
-  'https://mymyelomcare.netlify.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173').trim();
+  'https://mymyeloma.netlify.app,https://mymyelomcare.netlify.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173').trim();
 const RESEND_KEY  = (process.env.RESEND_API_KEY  || '').trim();
 const SESSION_SECRET = (process.env.SESSION_SECRET || ADMIN_CODE || 'change-me').trim();
 
@@ -44,10 +44,12 @@ const CREDS = loadCreds();
 // ─── CORS ─────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const o  = req.headers.origin || '';
-  const allowedOrigins = ALLOWED.split(',').map(a => a.trim()).filter(Boolean);
+  const norm = v => String(v || '').trim().replace(/\/+$/, '');
+  const origin = norm(o);
+  const allowedOrigins = ALLOWED.split(',').map(norm).filter(Boolean);
   const ok = !o || allowedOrigins.includes('*')
-    || allowedOrigins.includes(o)
-    || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o);
+    || allowedOrigins.includes(origin)
+    || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
   if (ok) res.setHeader('Access-Control-Allow-Origin', o || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
