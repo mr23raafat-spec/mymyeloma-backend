@@ -17,8 +17,10 @@ const PORT    = process.env.PORT || 3000;
 // ─── CONFIG ──────────────────────────────────────────────────────
 const ADMIN_CODE  = process.env.ADMIN_CODE || 'MyMyeloma@2025';
 const FOLDER_ID   = (process.env.DRIVE_FOLDER_ID || '').trim();
-const ALLOWED     = (process.env.ALLOWED_ORIGINS || '*').trim();
+const ALLOWED     = (process.env.ALLOWED_ORIGINS ||
+  'https://mymyelomcare.netlify.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173').trim();
 const RESEND_KEY  = (process.env.RESEND_API_KEY  || '').trim();
+const SESSION_SECRET = (process.env.SESSION_SECRET || ADMIN_CODE || 'change-me').trim();
 
 // ─── CLOUDINARY CONFIG ────────────────────────────────────────────
 const CLD_CLOUD  = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
@@ -42,9 +44,10 @@ const CREDS = loadCreds();
 // ─── CORS ─────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const o  = req.headers.origin || '';
-  const ok = !o || ALLOWED.includes('*')
-    || ALLOWED.split(',').some(a => o.startsWith(a.trim()))
-    || o.includes('localhost') || o.includes('netlify.app') || o.includes('onrender.com');
+  const allowedOrigins = ALLOWED.split(',').map(a => a.trim()).filter(Boolean);
+  const ok = !o || allowedOrigins.includes('*')
+    || allowedOrigins.includes(o)
+    || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o);
   if (ok) res.setHeader('Access-Control-Allow-Origin', o || '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -233,19 +236,138 @@ async function findUserRowIdx(token, userId) {
 
 async function findUserByEmail(token, email) {
   const rows = await sheetsRead(token, `${SHEET}!A2:J2000`);
+  const needle = (email || '').toLowerCase().trim();
   for (const row of rows) {
-    if (row[2]?.toLowerCase()===email?.toLowerCase()) return { user: rowToUser(row), rowIdx: rows.indexOf(row)+2 };
+    if ((row[2] || '').toLowerCase().trim() === needle) return { user: rowToUser(row), rowIdx: rows.indexOf(row)+2 };
   }
   return null;
 }
 
+async function findUserById(token, userId) {
+  const rows = await sheetsRead(token, `${SHEET}!A2:J2000`);
+  for (let i=0; i<rows.length; i++) {
+    if (rows[i][0] === userId) return { user: rowToUser(rows[i]), rowIdx: i+2 };
+  }
+  return null;
+}
+
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function signToken(data) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex');
+}
+
+function getBearer(req) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : '';
+}
+
+function makeAdminToken(bucket = Math.floor(Date.now() / 3600000)) {
+  return `adm.${bucket}.${signToken(`admin:${bucket}`)}`;
+}
+
+function verifyAdminToken(token) {
+  if (!token) return false;
+  const now = Math.floor(Date.now() / 3600000);
+
+  if (token.startsWith('adm.')) {
+    const [, bucketRaw, sig] = token.split('.');
+    const bucket = Number(bucketRaw);
+    if (!Number.isFinite(bucket) || Math.abs(now - bucket) > 1) return false;
+    return safeEqual(sig, signToken(`admin:${bucket}`));
+  }
+
+  // Accept the previous one-piece token for one hour to avoid kicking out old tabs.
+  return [now, now - 1].some(bucket =>
+    safeEqual(token, crypto.createHmac('sha256', ADMIN_CODE).update('admin:'+bucket).digest('hex'))
+  );
+}
+
+function requireAdmin(req, res, next) {
+  if (!verifyAdminToken(getBearer(req))) {
+    return res.status(401).json({ success:false, error:'جلسة الأدمن غير صالحة — سجّل الدخول مرة أخرى' });
+  }
+  req.isAdmin = true;
+  next();
+}
+
+function makeUserToken(user) {
+  const payload = b64u({ uid:user.id, exp:Date.now() + 1000*60*60*24*30 });
+  const secretPart = user.passHash || user.pass || '';
+  return `${payload}.${signToken(`user:${payload}:${secretPart}`)}`;
+}
+
+function decodePayload(payload) {
+  const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+}
+
+function safeUser(user) {
+  return { ...user, passHash:undefined, pass:undefined };
+}
+
+async function requireUserOrAdmin(req, res, next) {
+  try {
+    const bearer = getBearer(req);
+    if (verifyAdminToken(bearer)) {
+      req.isAdmin = true;
+      req.googleToken = await getToken();
+      return next();
+    }
+
+    const [payload, sig] = (bearer || '').split('.');
+    if (!payload || !sig) return res.status(401).json({ success:false, error:'يرجى تسجيل الدخول مرة أخرى' });
+
+    const data = decodePayload(payload);
+    if (!data.uid || !data.exp || Date.now() > data.exp) {
+      return res.status(401).json({ success:false, error:'انتهت جلسة الدخول — سجّل الدخول مرة أخرى' });
+    }
+
+    const token = await getToken();
+    const found = await findUserById(token, data.uid);
+    if (!found) return res.status(401).json({ success:false, error:'المستخدم غير موجود' });
+
+    const expected = signToken(`user:${payload}:${found.user.passHash || found.user.pass || ''}`);
+    if (!safeEqual(sig, expected)) {
+      return res.status(401).json({ success:false, error:'جلسة الدخول غير صالحة' });
+    }
+
+    req.googleToken = token;
+    req.authUser = found.user;
+    req.authRowIdx = found.rowIdx;
+    next();
+  } catch(e) {
+    console.error('[auth]', e.message);
+    res.status(401).json({ success:false, error:'تعذّر التحقق من الجلسة' });
+  }
+}
+
+function requireSelfOrAdmin(req, res, userId) {
+  if (req.isAdmin) return true;
+  return req.authUser?.id && req.authUser.id === userId;
+}
+
 // ─── ROUTES ───────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+  res.json({
+    status:'ok',
+    service:'MyMyeloma Backend',
+    health:'/api/health',
+    version:'v5.1'
+  });
+});
 
 // Health
 app.get('/api/health', (req, res) => {
   const lines = (CREDS.key||'').split('\n').length;
   res.json({
-    status:'ok', version:'v5', time:new Date().toISOString(),
+    status:'ok', version:'v5.1', time:new Date().toISOString(),
     node:process.version, keyOk:lines>=25, sheetId:_sid||'(auto-create)',
     folder:FOLDER_ID
   });
@@ -346,10 +468,28 @@ app.post('/api/admin/verify', (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({success:false,error:'Code required'});
   if (code !== ADMIN_CODE) return res.status(401).json({success:false,error:'رمز الأدمن غير صحيح'});
-  // Simple token — just timestamp HMAC
-  const token = crypto.createHmac('sha256', ADMIN_CODE)
-    .update('admin:'+Math.floor(Date.now()/3600000)).digest('hex');
+  const token = makeAdminToken();
   res.json({success:true, token, message:'مرحباً بالأدمن 🛡️'});
+});
+
+app.post('/api/admin/reset-password', async (req, res) => {
+  try {
+    const { adminCode, userId, newPassHash } = req.body || {};
+    const authorized = verifyAdminToken(getBearer(req)) || (adminCode && adminCode === ADMIN_CODE);
+    if (!authorized) return res.status(401).json({ success:false, error:'غير مصرح للأدمن' });
+    if (!userId || !newPassHash) return res.status(400).json({ success:false, error:'userId and newPassHash required' });
+
+    const token = await getToken();
+    const found = await findUserById(token, userId);
+    if (!found) return res.status(404).json({ success:false, error:'المستخدم غير موجود' });
+
+    const user = { ...found.user, passHash:newPassHash };
+    await sheetsWrite(token, `${SHEET}!A${found.rowIdx}:J${found.rowIdx}`, [userToRow(user)]);
+    res.json({ success:true, message:'تم تغيير كلمة السر بنجاح ✓' });
+  } catch(e) {
+    console.error('[admin-reset-password]', e.message);
+    res.status(500).json({ success:false, error:e.message });
+  }
 });
 
 // Register new user (saves to Sheets immediately)
@@ -373,7 +513,7 @@ app.post('/api/users/register', async (req, res) => {
     await sheetsAppend(token, [row]);
 
     console.log(`✅ New user registered: ${u.name} <${u.email}>`);
-    res.json({success:true, message:'تم التسجيل بنجاح ✓', userId:u.id});
+    res.json({success:true, message:'تم التسجيل بنجاح ✓', userId:u.id, sessionToken:makeUserToken({...u, passHash:u.passHash||u.pass})});
   } catch(e) {
     console.error('[register]', e.message);
     res.status(500).json({success:false, error:e.message});
@@ -406,8 +546,7 @@ app.post('/api/users/login', async (req, res) => {
     if (user.passHash!==passHash) return res.status(401).json({success:false,error:'كلمة السر غير صحيحة'});
     if (user.status==='blocked') return res.status(403).json({success:false,error:'الحساب محظور'});
 
-    const safeUser = {...user, passHash:undefined, pass:undefined};
-    res.json({success:true, user:safeUser, message:'مرحباً بك ✓'});
+    res.json({success:true, user:safeUser(user), sessionToken:makeUserToken(user), message:'مرحباً بك ✓'});
   } catch(e) {
     console.error('[login]', e.message);
     res.status(500).json({success:false, error:e.message});
@@ -415,13 +554,14 @@ app.post('/api/users/login', async (req, res) => {
 });
 
 // Get single user by ID (for cross-device sync)
-app.get('/api/users/:id', async (req, res) => {
+app.get('/api/users/:id', requireUserOrAdmin, async (req, res) => {
   try {
-    const token = await getToken();
-    const rows  = await sheetsRead(token, `${SHEET}!A2:J2000`);
-    const user  = rows.map(rowToUser).find(u => u?.id === req.params.id);
-    if (!user) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
-    res.json({ success: true, user: { ...user, passHash: undefined, pass: undefined } });
+    if (!requireSelfOrAdmin(req, res, req.params.id)) {
+      return res.status(403).json({ success:false, error:'غير مصرح لهذا المستخدم' });
+    }
+    const found = await findUserById(req.googleToken, req.params.id);
+    if (!found) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+    res.json({ success: true, user: safeUser(found.user) });
   } catch (e) {
     console.error('[user-get]', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -429,11 +569,11 @@ app.get('/api/users/:id', async (req, res) => {
 });
 
 // Get all users (admin)
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', requireAdmin, async (req, res) => {
   try {
     const token = await getToken();
     const users = await getAllUsers(token);
-    const safe  = users.map(u=>({...u,passHash:undefined,pass:undefined}));
+    const safe  = users.map(safeUser);
     res.json({success:true, users:safe, count:safe.length});
   } catch(e) {
     console.error('[users]', e.message);
@@ -442,17 +582,31 @@ app.get('/api/users', async (req, res) => {
 });
 
 // Update user data (labs, meds, chemo, visits, etc.)
-app.post('/api/users/update', async (req, res) => {
+app.post('/api/users/update', requireUserOrAdmin, async (req, res) => {
   try {
     const u = req.body;
     if (!u.id) return res.status(400).json({success:false,error:'id required'});
-    const token  = await getToken();
-    const rowIdx = await findUserRowIdx(token, u.id);
-    const row    = userToRow(u);
-    if (rowIdx>0) {
-      await sheetsWrite(token, `${SHEET}!A${rowIdx}:J${rowIdx}`, [row]);
+    if (!requireSelfOrAdmin(req, res, u.id)) {
+      return res.status(403).json({ success:false, error:'غير مصرح بتعديل هذا المستخدم' });
+    }
+
+    const found = await findUserById(req.googleToken, u.id);
+    const existing = found?.user || {};
+    const merged = {
+      ...existing,
+      ...u,
+      id: existing.id || u.id,
+      email: (existing.email || u.email || '').toLowerCase().trim(),
+      passHash: req.isAdmin ? (u.passHash || existing.passHash || '') : (existing.passHash || ''),
+      status: req.isAdmin ? (u.status || existing.status || 'active') : (existing.status || 'active')
+    };
+    if (!req.isAdmin) delete merged.pass;
+
+    const row = userToRow(merged);
+    if (found?.rowIdx>0) {
+      await sheetsWrite(req.googleToken, `${SHEET}!A${found.rowIdx}:J${found.rowIdx}`, [row]);
     } else {
-      await sheetsAppend(token, [row]);
+      await sheetsAppend(req.googleToken, [row]);
     }
     res.json({success:true, message:'تم تحديث البيانات ✓'});
   } catch(e) {
@@ -461,35 +615,8 @@ app.post('/api/users/update', async (req, res) => {
   }
 });
 
-// Admin reset password — sets a new passHash directly (no OTP needed)
-app.post('/api/admin/reset-password', async (req, res) => {
-  try {
-    const { adminCode, userId, newPassHash } = req.body;
-    if (!adminCode || !userId || !newPassHash)
-      return res.status(400).json({ success: false, error: 'adminCode, userId, newPassHash required' });
-    if (adminCode !== ADMIN_CODE)
-      return res.status(401).json({ success: false, error: 'رمز الأدمن غير صحيح' });
-
-    const token  = await getToken();
-    const rowIdx = await findUserRowIdx(token, userId);
-    if (rowIdx < 0) return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
-
-    const rows = await sheetsRead(token, `${SHEET}!A${rowIdx}:J${rowIdx}`);
-    if (!rows[0]) return res.status(404).json({ success: false, error: 'صف غير موجود' });
-    const user = rowToUser(rows[0]);
-    user.passHash = newPassHash;
-    await sheetsWrite(token, `${SHEET}!A${rowIdx}:J${rowIdx}`, [userToRow(user)]);
-
-    console.log(`🔑 Admin reset password for userId: ${userId}`);
-    res.json({ success: true, message: 'تم تغيير كلمة السر بنجاح' });
-  } catch (e) {
-    console.error('[admin-reset-password]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
 // Block / unblock
-app.post('/api/users/block', async (req, res) => {
+app.post('/api/users/block', requireAdmin, async (req, res) => {
   try {
     const { userId, status } = req.body;
     const token  = await getToken();
@@ -504,7 +631,7 @@ app.post('/api/users/block', async (req, res) => {
 });
 
 // Delete user
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const token  = await getToken();
     const rowIdx = await findUserRowIdx(token, req.params.id);
@@ -517,16 +644,29 @@ app.delete('/api/users/:id', async (req, res) => {
 });
 
 // Sync all (legacy endpoint — rewrites sheet)
-app.post('/api/drive/sync-all', async (req, res) => {
+app.post('/api/drive/sync-all', requireAdmin, async (req, res) => {
   try {
     const { content } = req.body;
     const users = Array.isArray(content) ? content : [];
     const token = await getToken();
+    const existingUsers = await getAllUsers(token);
+    const mergedUsers = users.map(u => {
+      const existing = existingUsers.find(e => e.id === u.id || e.email === u.email) || {};
+      return {
+        ...existing,
+        ...u,
+        id:u.id || existing.id,
+        email:(u.email || existing.email || '').toLowerCase().trim(),
+        passHash:u.passHash || existing.passHash || '',
+        files:u.files || existing.files || [],
+        status:u.status || existing.status || 'active'
+      };
+    });
     const sid2 = await getSheetId(token);
     await gApi(token,'POST','sheets.googleapis.com',
       `/v4/spreadsheets/${sid2}/values/${encodeURIComponent(`${SHEET}!A2:J2000`)}:clear`,{}); // clear data rows
-    if (users.length) await sheetsAppend(token, users.map(u=>userToRow({...u})));
-    res.json({success:true, count:users.length, message:`تمت مزامنة ${users.length} مستخدم ✓`});
+    if (mergedUsers.length) await sheetsAppend(token, mergedUsers.map(u=>userToRow({...u})));
+    res.json({success:true, count:mergedUsers.length, message:`تمت مزامنة ${mergedUsers.length} مستخدم ✓`});
   } catch(e) {
     console.error('[sync-all]', e.message);
     res.status(500).json({success:false, error:e.message});
@@ -534,16 +674,25 @@ app.post('/api/drive/sync-all', async (req, res) => {
 });
 
 // Upload single user (legacy endpoint — updates sheet)
-app.post('/api/drive/upload', async (req, res) => {
+app.post('/api/drive/upload', requireUserOrAdmin, async (req, res) => {
   try {
     const { content, userId } = req.body;
     if (!content) return res.status(400).json({success:false,error:'content required'});
-    const token  = await getToken();
     const id     = content.id || userId;
-    const rowIdx = await findUserRowIdx(token, id);
-    const row    = userToRow({...content,pass:undefined});
-    if (rowIdx>0) await sheetsWrite(token, `${SHEET}!A${rowIdx}:J${rowIdx}`, [row]);
-    else await sheetsAppend(token, [row]);
+    if (!requireSelfOrAdmin(req, res, id)) {
+      return res.status(403).json({ success:false, error:'غير مصرح بتعديل هذا المستخدم' });
+    }
+    const found = await findUserById(req.googleToken, id);
+    const row = userToRow({
+      ...(found?.user || {}),
+      ...content,
+      id,
+      passHash:req.isAdmin ? (content.passHash || found?.user?.passHash || '') : (found?.user?.passHash || ''),
+      status:req.isAdmin ? (content.status || found?.user?.status || 'active') : (found?.user?.status || 'active'),
+      pass:undefined
+    });
+    if (found?.rowIdx>0) await sheetsWrite(req.googleToken, `${SHEET}!A${found.rowIdx}:J${found.rowIdx}`, [row]);
+    else await sheetsAppend(req.googleToken, [row]);
     res.json({success:true, message:'تم الحفظ في Sheets ✓'});
   } catch(e) {
     console.error('[upload]', e.message);
@@ -552,7 +701,7 @@ app.post('/api/drive/upload', async (req, res) => {
 });
 
 // Drive list / sheet info
-app.get('/api/drive/list', async (req, res) => {
+app.get('/api/drive/list', requireAdmin, async (req, res) => {
   try {
     const token = await getToken();
     const sid   = await getSheetId(token);
@@ -607,15 +756,16 @@ function cldRequest(method, path, body) {
 }
 
 // Upload file to Cloudinary (base64)
-app.post('/api/drive/file-upload', async (req, res) => {
+app.post('/api/drive/file-upload', requireUserOrAdmin, async (req, res) => {
   try {
-    const { fileName, mimeType, base64Data: rawBase64, userId } = req.body;
-    if (!rawBase64 || !fileName) return res.status(400).json({ success: false, error: 'fileName and base64Data required' });
+    const { fileName, mimeType, base64Data } = req.body;
+    const userId = req.body.userId || req.authUser?.id;
+    if (!base64Data || !fileName) return res.status(400).json({ success: false, error: 'fileName and base64Data required' });
+    if (!requireSelfOrAdmin(req, res, userId)) {
+      return res.status(403).json({ success:false, error:'غير مصرح برفع ملف لهذا المستخدم' });
+    }
     if (!CLD_CLOUD || !CLD_KEY || !CLD_SECRET)
       return res.status(503).json({ success: false, error: 'Cloudinary غير مضبوط في البيئة' });
-
-    // ✅ شيل الـ data URI prefix لو موجود (مثل: data:image/png;base64,...)
-    const base64Data = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
 
     const timestamp  = Math.floor(Date.now() / 1000);
     const publicId   = `mymyeloma/${userId || 'u'}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
@@ -633,8 +783,8 @@ app.post('/api/drive/file-upload', async (req, res) => {
       Buffer.from(addPart('timestamp', timestamp)),
       Buffer.from(addPart('public_id', publicId)),
       Buffer.from(addPart('signature', signature)),
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
-      Buffer.from(base64Data, 'base64'),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"\r\n\r\n`),
+      Buffer.from(`data:${mimeType || 'application/octet-stream'};base64,${base64Data}`),
       Buffer.from(`\r\n--${boundary}--`)
     ]);
 
@@ -670,28 +820,24 @@ app.post('/api/drive/file-upload', async (req, res) => {
 app.get('/api/drive/file/:fileId(*)', async (req, res) => {
   try {
     const publicId = req.params.fileId;
-    // mime param from frontend (most reliable)
-    const mimeParam = req.query.mime || '';
-    const isImage   = mimeParam.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
+    const isImage  = /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
+    const isPDF    = /\.pdf$/i.test(publicId) || publicId.includes('.pdf');
     const resourceType = isImage ? 'image' : 'raw';
     const url = `https://res.cloudinary.com/${CLD_CLOUD}/${resourceType}/upload/${publicId}`;
 
-    const contentType = mimeParam || (isImage ? 'image/jpeg' : 'application/pdf');
-    const fileName    = publicId.split('/').pop() || 'file';
+    // اضبط الـ Content-Type الصح
+    let contentType = 'application/octet-stream';
+    if (isPDF)   contentType = 'application/pdf';
+    else if (/\.png$/i.test(publicId))  contentType = 'image/png';
+    else if (/\.(jpg|jpeg)$/i.test(publicId)) contentType = 'image/jpeg';
+
+    // اسم الملف من آخر جزء في الـ publicId
+    const rawName = publicId.split('/').pop() || 'file';
+    const fileName = decodeURIComponent(rawName);
 
     https.get(url, remote => {
-      if (remote.statusCode === 404) {
-        // جرب الـ resource type التاني لو 404
-        const fallbackType = isImage ? 'raw' : 'image';
-        const fallbackUrl  = `https://res.cloudinary.com/${CLD_CLOUD}/${fallbackType}/upload/${publicId}`;
-        https.get(fallbackUrl, r2 => {
-          res.setHeader('Content-Type', mimeParam || r2.headers['content-type'] || 'application/octet-stream');
-          res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
-          r2.pipe(res);
-        }).on('error', () => res.status(404).end());
-        return;
-      }
-      res.setHeader('Content-Type', mimeParam || remote.headers['content-type'] || contentType);
+      const finalType = remote.headers['content-type'] || contentType;
+      res.setHeader('Content-Type', finalType);
       res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
       if (remote.headers['content-length'])
         res.setHeader('Content-Length', remote.headers['content-length']);
@@ -705,9 +851,13 @@ app.get('/api/drive/file/:fileId(*)', async (req, res) => {
 });
 
 // Delete file from Cloudinary
-app.delete('/api/drive/file/:fileId(*)', async (req, res) => {
+app.delete('/api/drive/file/:fileId(*)', requireUserOrAdmin, async (req, res) => {
   try {
     const publicId   = req.params.fileId;
+    if (!req.isAdmin) {
+      const ownsFile = (req.authUser?.files || []).some(f => f.driveFileId === publicId);
+      if (!ownsFile) return res.status(403).json({ success:false, error:'غير مصرح بحذف هذا الملف' });
+    }
     const timestamp  = Math.floor(Date.now() / 1000);
     const isImage    = /\.(jpg|jpeg|png|gif|webp)$/i.test(publicId);
     const resourceType = isImage ? 'image' : 'raw';
@@ -784,8 +934,7 @@ app.post('/api/users/restore', async (req, res) => {
     if (user.status === 'blocked')
       return res.status(403).json({ success: false, error: 'الحساب محظور' });
 
-    const safeUser = { ...user, passHash: undefined, pass: undefined };
-    res.json({ success: true, user: safeUser, message: '✓ تم استرداد البيانات' });
+    res.json({ success: true, user: safeUser(user), sessionToken:makeUserToken(user), message: '✓ تم استرداد البيانات' });
   } catch (e) {
     console.error('[restore]', e.message);
     res.status(500).json({ success: false, error: e.message });
